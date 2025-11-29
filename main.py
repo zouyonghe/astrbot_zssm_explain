@@ -793,6 +793,8 @@ class ZssmExplain(Star):
                         ok.append(x)
             except Exception:
                 pass
+        if images and not ok:
+            logger.info("zssm_explain: images provided but none usable (not http/https or missing files)")
         return ok
 
     def _provider_supports_image(self, provider: Any) -> bool:
@@ -855,6 +857,7 @@ class ZssmExplain(Star):
         """
         tried = set()
         images_present = bool(image_urls)
+        max_retries = 2  # 单 Provider 重试次数
 
         async def _try_call(p: Any) -> Optional[Any]:
             return await p.text_chat(
@@ -864,12 +867,31 @@ class ZssmExplain(Star):
                 image_urls=image_urls,
             )
 
+        async def _try_call_with_retry(p: Any) -> Optional[Any]:
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return await _try_call(p)
+                except Exception as ex:
+                    last_exc = ex
+                    logger.warning(
+                        "zssm_explain: provider %s attempt %s/%s failed: %s",
+                        getattr(p, "id", None) or getattr(p, "name", None) or type(p).__name__,
+                        attempt,
+                        max_retries,
+                        ex,
+                    )
+            if last_exc:
+                raise last_exc
+            return None
+
         # 1) primary
         if primary is not None:
             tried.add(id(primary))
             try:
-                return await _try_call(primary)
-            except Exception:
+                return await _try_call_with_retry(primary)
+            except Exception as ex:
+                logger.warning("zssm_explain: primary provider failed after retries: %s", ex)
                 pass
 
         # 2) session provider
@@ -878,8 +900,9 @@ class ZssmExplain(Star):
             try:
                 # 图片时校验能力
                 if not images_present or self._provider_supports_image(session_provider):
-                    return await _try_call(session_provider)
-            except Exception:
+                    return await _try_call_with_retry(session_provider)
+            except Exception as ex:
+                logger.warning("zssm_explain: session provider failed after retries: %s", ex)
                 pass
 
         # 3) enumerate others
@@ -890,13 +913,18 @@ class ZssmExplain(Star):
                 continue
             tried.add(id(p))
             try:
-                resp = await _try_call(p)
+                resp = await _try_call_with_retry(p)
                 logger.info(
                     "zssm_explain: fallback %s provider succeeded",
                     "vision" if images_present else "text",
                 )
                 return resp
-            except Exception:
+            except Exception as ex:
+                logger.warning(
+                    "zssm_explain: fallback provider %s failed after retries: %s",
+                    getattr(p, "id", None) or getattr(p, "name", None) or type(p).__name__,
+                    ex,
+                )
                 continue
 
         raise RuntimeError("all providers failed for current request")
@@ -1381,6 +1409,8 @@ class ZssmExplain(Star):
 
         system_prompt = build_system_prompt()
         image_urls = self._filter_supported_images(images)
+        if (not text or not text.strip()) and not image_urls:
+            logger.info("zssm_explain: no text or usable images extracted for current request")
 
         try:
             # 统一选择与回退
