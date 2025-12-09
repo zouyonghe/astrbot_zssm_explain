@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Any, Dict
+from typing import List, Tuple, Optional, Any, Dict, Set
 import os
 import asyncio
 import re
 import shutil
 import tempfile
 import subprocess
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 import math
+import time
 
 try:
     import aiohttp  # 优先使用异步 HTTP 客户端
@@ -31,8 +32,9 @@ from .url_utils import (
     wait_cf_screenshot_ready,
     download_image_to_temp,
     resolve_liveshot_image_url,
+    extract_urls_from_text,
 )
-from .message_utils import extract_quoted_payload, get_reply_message_id
+from .message_utils import extract_quoted_payload
 from .video_utils import (
     extract_videos_from_chain,
     extract_videos_from_event,
@@ -41,13 +43,23 @@ from .video_utils import (
     napcat_resolve_file_url,
     extract_videos_from_onebot_message_payload,
     probe_duration_sec,
+    resolve_ffmpeg,
+    resolve_ffprobe,
+    download_video_to_temp,
 )
+from .bilibili_utils import is_bilibili_url, download_bilibili_video_to_temp
 from .prompt_utils import (
     DEFAULT_URL_USER_PROMPT,
     DEFAULT_VIDEO_USER_PROMPT,
     DEFAULT_FRAME_CAPTION_PROMPT,
     build_user_prompt,
     build_system_prompt,
+)
+from .file_preview_utils import (
+    build_text_exts_from_config,
+    extract_file_preview_from_reply,
+    extract_group_file_video_url_from_reply,
+    pdf_bytes_to_markdown,
 )
 
 """
@@ -64,7 +76,6 @@ KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
-ENABLE_VIDEO_EXPLAIN_KEY = "enable_video_explain"
 VIDEO_FRAME_INTERVAL_SEC_KEY = "video_frame_interval_sec"
 VIDEO_ASR_ENABLE_KEY = "video_asr_enable"
 VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
@@ -72,30 +83,33 @@ VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
 FFMPEG_PATH_KEY = "ffmpeg_path"
 ASR_PROVIDER_ID_KEY = "asr_provider_id"
 CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
-CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
-CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
+CF_SCREENSHOT_SIZE_KEY = "cf_screenshot_size"
+KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
+FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
+FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
 DEFAULT_URL_MAX_CHARS = 6000
-DEFAULT_ENABLE_VIDEO_EXPLAIN = True
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
 DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
 DEFAULT_CF_SCREENSHOT_ENABLE = True
-DEFAULT_CF_SCREENSHOT_WIDTH = 1280
-DEFAULT_CF_SCREENSHOT_HEIGHT = 720
+DEFAULT_CF_SCREENSHOT_SIZE = "1280x720"
+DEFAULT_KEEP_ORIGINAL_PERSONA = False
+DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
+DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
 
 
 
 
 @register(
-    "zssm_explain",
+    "astrbot_zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "2.1.0",
+    "v3.8.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -256,133 +270,14 @@ class ZssmExplain(Star):
         return extract_videos_from_onebot_message_payload(payload)
 
     def _resolve_ffmpeg(self) -> Optional[str]:
-        # 配置优先
-        path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
-        if path and shutil.which(path):
-            return shutil.which(path)
-        # 尝试系统 ffmpeg
-        sys_ffmpeg = shutil.which("ffmpeg")
-        if sys_ffmpeg:
-            return sys_ffmpeg
-        # 尝试 imageio-ffmpeg
-        try:
-            import imageio_ffmpeg
-            p = imageio_ffmpeg.get_ffmpeg_exe()
-            if p and os.path.exists(p):
-                return p
-        except Exception:
-            pass
-        return None
+        """根据插件配置解析 ffmpeg 路径，委托 video_utils.resolve_ffmpeg。"""
+        cfg_path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
+        return resolve_ffmpeg(cfg_path, DEFAULT_FFMPEG_PATH)
 
     def _resolve_ffprobe(self) -> Optional[str]:
-        # 同目录的 ffprobe（若 imageio-ffmpeg 提供）或系统 ffprobe
-        sys_ffprobe = shutil.which("ffprobe")
-        if sys_ffprobe:
-            return sys_ffprobe
-        # 粗略尝试：若 ffmpeg 同目录存在 ffprobe
+        """根据已解析的 ffmpeg 路径解析 ffprobe，委托 video_utils.resolve_ffprobe。"""
         ff = self._resolve_ffmpeg()
-        if ff:
-            cand = os.path.join(os.path.dirname(ff), "ffprobe")
-            if os.path.exists(cand):
-                return cand
-        return None
-
-    async def _download_to_temp(self, url: str, size_mb_limit: int) -> Optional[str]:
-        # 为 URL 提取安全的短扩展名，避免把查询串当后缀导致路径过长
-        def _safe_ext_from_url(u: str) -> str:
-            try:
-                path = urlparse(u).path
-                base = os.path.basename(unquote(path))
-                ext = os.path.splitext(base)[1]
-                # 限制扩展名长度并校验字符
-                if isinstance(ext, str):
-                    ext = ext[:8]
-                if not ext or not re.match(r"^\.[A-Za-z0-9]{1,6}$", ext):
-                    # 尝试常见视频后缀匹配
-                    lower = base.lower()
-                    for cand in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv"):
-                        if lower.endswith(cand):
-                            return cand
-                    return ".bin"
-                return ext
-            except Exception:
-                return ".bin"
-
-        ext = _safe_ext_from_url(url)
-        tmp = tempfile.NamedTemporaryFile(prefix="zssm_video_", suffix=ext, delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        max_bytes = size_mb_limit * 1024 * 1024
-        if aiohttp is not None:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(url, timeout=20) as resp:
-                        if resp.status != 200:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-                            return None
-                        # 内容长度预判
-                        cl = resp.headers.get("Content-Length")
-                        if cl and cl.isdigit() and int(cl) > max_bytes:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-                            return None
-                        total = 0
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(8192):
-                                if not chunk:
-                                    break
-                                total += len(chunk)
-                                if total > max_bytes:
-                                    try:
-                                        f.close()
-                                    except Exception:
-                                        pass
-                                    try:
-                                        os.remove(tmp_path)
-                                    except Exception:
-                                        pass
-                                    return None
-                                f.write(chunk)
-                return tmp_path if os.path.exists(tmp_path) else None
-            except Exception:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                return None
-        # urllib 回退
-        try:
-            import urllib.request
-            with urllib.request.urlopen(url, timeout=20) as r, open(tmp_path, "wb") as f:
-                total = 0
-                while True:
-                    chunk = r.read(8192)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > max_bytes:
-                        try:
-                            f.close()
-                        except Exception:
-                            pass
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                        return None
-                    f.write(chunk)
-            return tmp_path if os.path.exists(tmp_path) else None
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-            return None
+        return resolve_ffprobe(ff)
 
     def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
         """兼容旧接口，委托 video_utils.probe_duration_sec。"""
@@ -583,13 +478,20 @@ class ZssmExplain(Star):
         return session_provider
 
     async def _explain_video(self, event: AstrMessageEvent, video_src: str):
-        # 配置检查
-        if not self._get_conf_bool(ENABLE_VIDEO_EXPLAIN_KEY, DEFAULT_ENABLE_VIDEO_EXPLAIN):
-            yield self._reply_text_result(event, "视频解释功能未启用。")
+        # 配置检查：未配置 video_provider_id 时视为未启用视频解释
+        cfg_video_provider = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
+        if cfg_video_provider is None:
+            yield self._reply_text_result(
+                event,
+                "视频解释未配置可用的模型提供商，请在插件配置中选择 video_provider_id 后再试。",
+            )
             return
         ffmpeg_path = self._resolve_ffmpeg()
         if not ffmpeg_path:
-            yield self._reply_text_result(event, "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。")
+            yield self._reply_text_result(
+                event,
+                "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。",
+            )
             return
         logger.info("zssm_explain: video start src=%s ffmpeg=%s", (str(video_src)[:128] if video_src else ""), ffmpeg_path)
 
@@ -597,56 +499,88 @@ class ZssmExplain(Star):
         max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
         local_path = None
         src = video_src
-        # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
-        if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+        # 优先特判 B 站视频链接：通过 video_utils 解析并下载到临时文件
+        if isinstance(src, str) and self._is_http_url(src) and is_bilibili_url(src):
             try:
-                resolved = await self._napcat_resolve_file_url(event, src)
-            except Exception:
-                resolved = None
-            if isinstance(resolved, str) and resolved:
-                src = resolved
-        if isinstance(src, str) and self._is_http_url(src):
-            local_path = await self._download_to_temp(src, max_mb)
-            if not local_path:
-                yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
+                bili_local = await download_bilibili_video_to_temp(src, max_mb)
+            except Exception as e:
+                logger.warning("zssm_explain: bilibili download failed: %s", e)
+                bili_local = None
+            if bili_local:
+                local_path = bili_local
+            else:
+                # B 站链接解析失败时直接给出友好提示，避免误将网页当作视频文件处理
+                yield self._reply_text_result(
+                    event,
+                    "暂时无法解析该 B 站视频链接，请确认视频为公开可访问状态，或改为发送视频文件/截图后再试。",
+                )
                 return
-        else:
-            # 假定为本地路径
-            if not (isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)):
-                yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
-                return
-            # 大小检查
-            try:
-                sz = os.path.getsize(src)
-                if sz > max_mb * 1024 * 1024:
-                    yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
+
+        # 若尚未得到本地路径，再按通用逻辑处理 Napcat/file_id 与普通 http 链接/本地路径
+        if local_path is None:
+            # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
+            if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+                try:
+                    resolved = await self._napcat_resolve_file_url(event, src)
+                except Exception:
+                    resolved = None
+                if isinstance(resolved, str) and resolved:
+                    src = resolved
+            if isinstance(src, str) and self._is_http_url(src):
+                local_path = await download_video_to_temp(src, max_mb)
+                if not local_path:
+                    yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
                     return
-            except Exception:
-                pass
-            local_path = src
+            else:
+                # 假定为本地路径
+                if not (isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)):
+                    yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
+                    return
+                # 大小检查
+                try:
+                    sz = os.path.getsize(src)
+                    if sz > max_mb * 1024 * 1024:
+                        yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
+                        return
+                except Exception:
+                    pass
+                local_path = src
 
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
-        dur = self._probe_duration_sec(self._resolve_ffprobe(), local_path)
+        dur = self._probe_duration_sec(resolve_ffprobe(ffmpeg_path), local_path)
         logger.info("zssm_explain: probed duration=%s (max=%s)", dur if dur is not None else "unknown", max_sec)
         if isinstance(dur, (int, float)) and dur > max_sec:
             yield self._reply_text_result(event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。")
             return
 
         # 抽帧
+        is_gif = False
+        try:
+            if isinstance(local_path, str) and local_path.lower().endswith(".gif"):
+                is_gif = True
+        except Exception:
+            is_gif = False
+
         interval = self._get_conf_int(VIDEO_FRAME_INTERVAL_SEC_KEY, DEFAULT_VIDEO_FRAME_INTERVAL_SEC, 1, 120)
         try:
             if isinstance(dur, (int, float)) and dur > 0:
-                # 依据时长与间隔估算目标帧数
-                n_frames = max(1, int(math.ceil(float(dur) / max(1, interval))))
+                # 依据时长与间隔估算目标帧数；GIF 固定抽 1 帧
+                if is_gif:
+                    n_frames = 1
+                else:
+                    n_frames = max(1, int(math.ceil(float(dur) / max(1, interval))))
                 logger.info(
                     "zssm_explain: sampling plan: duration=%.2fs interval=%ss => target_frames=%s",
                     float(dur), interval, n_frames,
                 )
                 frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), n_frames)
             else:
-                # 未获知时长时，以最大允许时长作为上界推导帧数
-                n_frames = max(1, int(math.ceil(float(max_sec) / max(1, interval))))
+                # 未获知时长时，以最大允许时长作为上界推导帧数；GIF 固定抽 1 帧
+                if is_gif:
+                    n_frames = 1
+                else:
+                    n_frames = max(1, int(math.ceil(float(max_sec) / max(1, interval))))
                 logger.info(
                     "zssm_explain: sampling plan: unknown duration, use max_sec=%ss interval=%ss => target_frames=%s",
                     max_sec, interval, n_frames,
@@ -661,9 +595,14 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
             return
 
-        # 可选 ASR
+        # 可选 ASR：由 video_asr_enable + asr_provider_id 控制
         asr_text = None
-        if self._get_conf_bool(VIDEO_ASR_ENABLE_KEY, DEFAULT_VIDEO_ASR_ENABLE):
+        asr_enabled = False
+        try:
+            asr_enabled = self._get_conf_bool(VIDEO_ASR_ENABLE_KEY, DEFAULT_VIDEO_ASR_ENABLE)
+        except Exception:
+            asr_enabled = DEFAULT_VIDEO_ASR_ENABLE
+        if asr_enabled:
             try:
                 wav = await self._extract_audio_wav(ffmpeg_path, local_path)
                 if wav and os.path.exists(wav):
@@ -676,7 +615,10 @@ class ZssmExplain(Star):
                     if stt is not None:
                         try:
                             asr_text = await stt.get_text(wav)
-                            logger.info("zssm_explain: asr text length=%s", len(asr_text) if isinstance(asr_text, str) else 0)
+                            logger.info(
+                                "zssm_explain: asr text length=%s",
+                                len(asr_text) if isinstance(asr_text, str) else 0,
+                            )
                         except Exception:
                             asr_text = None
                     try:
@@ -695,13 +637,14 @@ class ZssmExplain(Star):
         if not provider:
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
-        system_prompt = build_system_prompt()
+        system_prompt = await self._build_system_prompt(event)
         meta = {
             "name": os.path.basename(local_path),
             "duration": dur if isinstance(dur, (int, float)) else None,
             "frames": len(image_urls),
         }
         try:
+            start_ts = time.perf_counter()
             call_provider = self._select_video_provider(provider, image_urls)
             try:
                 pid = getattr(call_provider, "id", None) or getattr(call_provider, "provider_id", None) or call_provider.__class__.__name__
@@ -763,6 +706,13 @@ class ZssmExplain(Star):
                 show_reasoning = False
             if not show_reasoning:
                 reply_text = self._sanitize_model_output(reply_text)
+
+            elapsed = None
+            try:
+                elapsed = time.perf_counter() - start_ts
+            except Exception:
+                elapsed = None
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
             yield self._reply_text_result(event, reply_text)
             try:
                 event.stop_event()
@@ -1043,77 +993,166 @@ class ZssmExplain(Star):
             pass
         return default
 
+    def _get_file_preview_exts(self) -> Set[str]:
+        """从配置构造文本文件预览的扩展名集合（含点）。"""
+        raw = self._get_conf_str(FILE_PREVIEW_EXTS_KEY, DEFAULT_FILE_PREVIEW_EXTS)
+        base_default = [ext.strip() for ext in DEFAULT_FILE_PREVIEW_EXTS.split(",") if ext.strip()]
+        return build_text_exts_from_config(raw, base_default)
 
-    async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
-        """下载图片到临时文件并返回路径。"""
-        if not url:
+    def _get_file_preview_max_bytes(self) -> Optional[int]:
+        """获取允许尝试内容预览的群文件最大体积（字节）。"""
+        try:
+            kb = self._get_conf_int(FILE_PREVIEW_MAX_SIZE_KB_KEY, DEFAULT_FILE_PREVIEW_MAX_SIZE_KB, 1, 1024 * 1024)
+        except Exception:
+            kb = DEFAULT_FILE_PREVIEW_MAX_SIZE_KB
+        try:
+            return int(kb) * 1024
+        except Exception:
+            return None
+
+    def _get_cf_screenshot_size(self) -> Tuple[int, int]:
+        """从配置解析 Cloudflare 截图尺寸（宽、高，带边界校验）。"""
+        raw = self._get_conf_str(CF_SCREENSHOT_SIZE_KEY, DEFAULT_CF_SCREENSHOT_SIZE)
+        w, h = 1280, 720
+        if isinstance(raw, str) and "x" in raw.lower():
+            try:
+                parts = raw.lower().split("x")
+                if len(parts) == 2:
+                    w = int(parts[0].strip())
+                    h = int(parts[1].strip())
+            except Exception:
+                w, h = 1280, 720
+        # 边界与兜底
+        try:
+            w = max(320, min(int(w), 4096))
+        except Exception:
+            w = 1280
+        try:
+            h = max(240, min(int(h), 4096))
+        except Exception:
+            h = 720
+        return w, h
+
+    async def _build_system_prompt(self, event: AstrMessageEvent) -> str:
+        """根据配置与当前会话人格构造系统提示词。
+
+        当 keep_original_persona 启用时：
+        - 从 AstrBot persona_manager 获取当前会话应使用的人格（v3 格式）；
+        - 使用人格的 prompt 替换 DEFAULT_SYSTEM_PROMPT 的首行描述部分，
+          保留原有的 Markdown 结构与输出约束说明。
+        未启用或获取人格失败时，回退为默认系统提示词。
+        """
+        sp = build_system_prompt()
+
+        # 未启用开关时，直接使用默认提示词
+        try:
+            if not self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA):
+                return sp
+        except Exception:
+            return sp
+
+        # 仅在存在 persona_manager 时尝试获取当前会话人格
+        try:
+            persona_mgr = getattr(self.context, "persona_manager", None)
+        except Exception:
+            persona_mgr = None
+        if persona_mgr is None:
+            return sp
+
+        persona_prompt: Optional[str] = None
+        try:
+            # get_default_persona_v3 会综合会话配置与 persona 绑定，返回 Personality（含 prompt）
+            personality = await persona_mgr.get_default_persona_v3(event.unified_msg_origin)
+            if isinstance(personality, dict):
+                persona_prompt = personality.get("prompt")
+            else:
+                persona_prompt = getattr(personality, "prompt", None)
+        except Exception as e:
+            logger.warning(f"zssm_explain: get_default_persona_v3 failed: {e}")
+            persona_prompt = None
+
+        if not isinstance(persona_prompt, str) or not persona_prompt.strip():
+            return sp
+
+        # 使用人格 prompt 替换默认系统提示词的首行，保留其余结构化输出要求
+        base_lines = sp.splitlines()
+        rest_lines = base_lines[1:] if len(base_lines) > 1 else []
+        merged_lines: List[str] = [persona_prompt.strip()]
+        merged_lines.extend(rest_lines)
+        return "\n".join(merged_lines)
+
+
+    async def _fetch_pdf_bytes(self, url: str, timeout_sec: int, max_bytes: int) -> Optional[bytes]:
+        """拉取 PDF 二进制内容，限制最大体积，避免将二进制内容按文本处理。
+
+        返回值为不超过 max_bytes 的二进制数据，超出或失败时返回 None。
+        """
+        if not url or not isinstance(max_bytes, int) or max_bytes <= 0:
             return None
         headers = {
             "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
-            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            "Accept": "application/pdf,*/*;q=0.8",
         }
 
-        async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
-            if aiohttp is not None:
-                try:
-                    async with aiohttp.ClientSession(headers=headers) as session:
-                        async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                            if 200 <= int(resp.status) < 400:
-                                data = await resp.read()
-                                return data, resp.headers.get("Content-Type")
-                except Exception:
-                    pass
-            import urllib.request
-            import urllib.error
-
-            def _do() -> Tuple[Optional[bytes], Optional[str]]:
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                        status = getattr(resp, "status", 200)
-                        if 200 <= int(status) < 400:
-                            data = resp.read()
-                            return data, resp.headers.get("Content-Type")
-                except Exception:
-                    return (None, None)
-                return (None, None)
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _do)
-
-        data, content_type = await _fetch()
-        if not data:
+        async def _aiohttp_fetch() -> Optional[bytes]:
+            if aiohttp is None:
+                return None
+            try:
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                        status = int(resp.status)
+                        if 200 <= status < 400:
+                            data = await resp.content.read(max_bytes + 1)
+                            if len(data) > max_bytes:
+                                logger.warning("zssm_explain: pdf over size limit when fetching url=%s", url)
+                                return None
+                            return data
+            except Exception as e:
+                logger.warning(f"zssm_explain: aiohttp fetch pdf failed: {e}")
+                return None
             return None
-        suffix = ".png"
-        if isinstance(content_type, str):
-            if "jpeg" in content_type.lower():
-                suffix = ".jpg"
-            elif "webp" in content_type.lower():
-                suffix = ".webp"
-        try:
-            fd, path = tempfile.mkstemp(prefix="zssm_cf_", suffix=suffix)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            return path
-        except Exception as e:
-            logger.warning(f"zssm_explain: failed to save screenshot temp file: {e}")
-            return None
+
+        data = await _aiohttp_fetch()
+        if data is not None:
+            return data
+
+        import urllib.request
+        import urllib.error
+
+        def _do() -> Optional[bytes]:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    status = getattr(resp, "status", 200)
+                    if not (200 <= int(status) < 400):
+                        return None
+                    chunks: List[bytes] = []
+                    remaining = max_bytes + 1
+                    while remaining > 0:
+                        chunk = resp.read(min(8192, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                        if remaining <= 0:
+                            logger.warning("zssm_explain: pdf over size limit in urllib fetch url=%s", url)
+                            return None
+                    return b"".join(chunks)
+            except urllib.error.HTTPError as e:
+                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
+                return None
+            except Exception as e:
+                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
+                return None
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
+
 
     @staticmethod
     def _extract_urls_from_text(text: Optional[str]) -> List[str]:
-        if not isinstance(text, str) or not text:
-            return []
-        # 基本 URL 正则：匹配 http/https 及常见顶级域名
-        url_pattern = re.compile(r"(https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+)", re.IGNORECASE)
-        urls = [m.group(1) for m in url_pattern.finditer(text)]
-        # 去重并保持顺序
-        seen = set()
-        uniq = []
-        for u in urls:
-            if u not in seen:
-                uniq.append(u)
-                seen.add(u)
-        return uniq
+        """兼容旧接口，委托 url_utils.extract_urls_from_text。"""
+        return extract_urls_from_text(text)
 
     def _build_url_user_prompt(self, url: str, html: str) -> Tuple[str, str]:
         title = extract_title(html)
@@ -1134,7 +1173,41 @@ class ZssmExplain(Star):
         return title or "", desc or "", snippet
 
     async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
-        """统一处理网页抓取：成功返回 HTML 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。"""
+        """统一处理网页抓取：成功返回 HTML/Markdown 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。
+
+        对于以 .pdf 结尾的链接，优先尝试按 PDF 文档处理，使用 PyPDF2 提取 Markdown 文本，
+        避免将二进制内容误当作 HTML 文本导致 LLM 看到乱码。
+        """
+        # 1) 特判 PDF 链接：直接按 PDF 处理并生成 Markdown 片段
+        try:
+            path = urlparse(url).path
+            _, ext = os.path.splitext(str(path).lower())
+        except Exception:
+            ext = ""
+        if ext == ".pdf":
+            max_bytes = self._get_file_preview_max_bytes()
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                max_bytes = 2 * 1024 * 1024
+            pdf_bytes = await self._fetch_pdf_bytes(url, timeout_sec, max_bytes)
+            if pdf_bytes:
+                text = pdf_bytes_to_markdown(pdf_bytes)
+                if text:
+                    max_chars = self._get_conf_int(
+                        URL_MAX_CHARS_KEY,
+                        DEFAULT_URL_MAX_CHARS,
+                        min_v=1000,
+                        max_v=50000,
+                    )
+                    snippet = text[:max_chars]
+                    user_prompt = DEFAULT_URL_USER_PROMPT.format(
+                        url=url,
+                        title="(PDF 文档)",
+                        desc="从 PDF 正文中提取的文本内容。",
+                        snippet=snippet,
+                    )
+                    return (user_prompt, None, [])
+
+        # 2) 常规 HTML 场景
         html = await fetch_html(url, timeout_sec, self._last_fetch_info)
         if html:
             user_prompt, _ = self._build_url_user_prompt(url, html)
@@ -1143,10 +1216,11 @@ class ZssmExplain(Star):
         info = getattr(self, "_last_fetch_info", {}) or {}
         is_cf = bool(info.get("cloudflare"))
         if is_cf and self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
+            width, height = self._get_cf_screenshot_size()
             screenshot_url = build_cf_screenshot_url(
                 url,
-                self._get_conf_int(CF_SCREENSHOT_WIDTH_KEY, DEFAULT_CF_SCREENSHOT_WIDTH, 320, 4096),
-                self._get_conf_int(CF_SCREENSHOT_HEIGHT_KEY, DEFAULT_CF_SCREENSHOT_HEIGHT, 240, 4096),
+                width,
+                height,
             )
             if screenshot_url:
                 logger.warning(
@@ -1298,6 +1372,28 @@ class ZssmExplain(Star):
         # 5) 若清洗后为空，则回退原文（避免误删全部内容）
         return s or text.strip()
 
+    def _format_explain_output(
+        self,
+        content: str,
+        elapsed_sec: Optional[float] = None,
+    ) -> str:
+        """统一格式化解释结果，仅追加耗时信息。
+
+        “关键词：...” 行以及“**详细阐述：**”等结构由 LLM 自行生成。
+        """
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        body = content.strip()
+        if not body:
+            return ""
+
+        parts: List[str] = [body]
+        if isinstance(elapsed_sec, (int, float)) and elapsed_sec > 0:
+            parts.append("")
+            parts.append(f"cost: {elapsed_sec:.3f}s")
+
+        return "\n".join(parts)
+
     def _get_config_provider(self, key: str) -> Optional[Any]:
         """根据插件配置项（text_provider_id / image_provider_id）返回 Provider 实例。"""
         try:
@@ -1329,10 +1425,18 @@ class ZssmExplain(Star):
 
         # 1) 先解析内联内容
         if inline:
-            # 若内联包含 URL，优先走“网页摘要”流程
+            # 若内联包含 URL，优先检测是否为 B 站视频链接，其次才走“网页摘要”流程
             urls = self._extract_urls_from_text(inline) if enable_url else []
             if urls:
                 target_url = urls[0]
+                # B 站视频链接优先走视频解释流程
+                if is_bilibili_url(target_url):
+                    try:
+                        async for r in self._explain_video(event, target_url):
+                            yield r
+                        return
+                    except Exception as e:
+                        logger.warning("zssm_explain: inline bilibili handle failed: %s", e)
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
                 if not url_ctx:
@@ -1353,8 +1457,31 @@ class ZssmExplain(Star):
                 async for r in self._explain_video(event, vids[0]):
                     yield r
                 return
+            # 2.1) 若未检测到视频，再尝试“被回复的群文件”是否为视频后缀
+            try:
+                v_url = await extract_group_file_video_url_from_reply(event)
+            except Exception:
+                v_url = None
+            if v_url:
+                async for r in self._explain_video(event, v_url):
+                    yield r
+                return
             # 3) 再尝试被回复消息中的文本/图片
             text, images, from_forward = await self._extract_quoted_payload(event)
+            # 若仍未提取到文本/图片，尝试从群文件构造内容预览
+            try:
+                file_preview = await extract_file_preview_from_reply(
+                    event,
+                    text_exts=self._get_file_preview_exts(),
+                    max_size_bytes=self._get_file_preview_max_bytes(),
+                )
+            except Exception:
+                file_preview = None
+            if file_preview:
+                if text:
+                    text = f"{file_preview}\n\n{text}"
+                else:
+                    text = file_preview
             if not text and not images:
                 yield self._reply_text_result(event, "请输入要解释的内容。")
                 event.stop_event()
@@ -1365,6 +1492,14 @@ class ZssmExplain(Star):
             if urls and not from_forward:
                 # 非合并转发场景，沿用原有“网页摘要优先”的行为
                 target_url = urls[0]
+                # 若为 B 站视频链接，则优先走视频解释流程
+                if is_bilibili_url(target_url):
+                    try:
+                        async for r in self._explain_video(event, target_url):
+                            yield r
+                        return
+                    except Exception as e:
+                        logger.warning("zssm_explain: reply bilibili handle failed: %s", e)
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
                 if not url_ctx:
@@ -1407,13 +1542,14 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
-        system_prompt = build_system_prompt()
+        system_prompt = await self._build_system_prompt(event)
         image_urls = self._filter_supported_images(images)
         if (not text or not text.strip()) and not image_urls:
             logger.info("zssm_explain: no text or usable images extracted for current request")
 
         try:
             # 统一选择与回退
+            start_ts = time.perf_counter()
             call_provider = self._select_primary_provider(provider, image_urls)
             llm_resp = await self._call_llm_with_fallback(
                 primary=call_provider,
@@ -1449,6 +1585,13 @@ class ZssmExplain(Star):
                 show_reasoning = False
             if not show_reasoning:
                 reply_text = self._sanitize_model_output(reply_text)
+
+            elapsed = None
+            try:
+                elapsed = time.perf_counter() - start_ts
+            except Exception:
+                elapsed = None
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
             yield self._reply_text_result(event, reply_text)
             # 防止后续流程重复处理当前事件
             try:

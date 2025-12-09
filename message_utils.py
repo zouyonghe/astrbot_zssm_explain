@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional, Any, Dict
+import json
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -74,6 +75,92 @@ def chain_has_forward(chain: List[object]) -> bool:
     return False
 
 
+def _strip_bracket_prefix(text: str) -> str:
+    """去掉类似 [QQ小程序] / 【聊天记录】 这样的前缀标签。"""
+    if not isinstance(text, str):
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+    if s.startswith("["):
+        end = s.find("]")
+        if end != -1:
+            return s[end + 1 :].strip()
+    if s.startswith("【"):
+        end = s.find("】")
+        if end != -1:
+            return s[end + 1 :].strip()
+    return s
+
+
+def _format_json_share(data: Dict[str, Any]) -> str:
+    """
+    解析 Napcat/OneBot json 消息 (data.data 对应的结构化 JSON)，提取关键信息。
+
+    支持：
+    - 聊天记录: app = com.tencent.multimsg
+    - QQ 小程序分享（含 B 站小程序）: app = com.tencent.miniapp_01
+    - 普通图文/小程序卡片: app = com.tencent.tuwen.lua
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    app = data.get("app") or ""
+
+    # 3) 合并转发聊天记录
+    if app == "com.tencent.multimsg":
+        prompt = data.get("prompt") or data.get("desc") or "[聊天记录]"
+        detail = data.get("meta", {}).get("detail", {}) or {}
+        summary = detail.get("summary") or ""
+        source = detail.get("source") or ""
+        lines = [str(prompt).strip() or "[聊天记录]"]
+        if source:
+            lines.append(f"来源: {source}")
+        if summary:
+            lines.append(f"摘要: {summary}")
+        return "\n".join(lines)
+
+    # 2) B 站等 QQ 小程序分享
+    if app == "com.tencent.miniapp_01":
+        detail = data.get("meta", {}).get("detail_1", {}) or {}
+        raw_prompt = str(data.get("prompt") or "").strip()
+        title = _strip_bracket_prefix(raw_prompt) or detail.get("desc") or "无标题"
+        desc = detail.get("desc") or ""
+        url = detail.get("qqdocurl") or detail.get("url") or ""
+        preview = detail.get("preview") or ""
+        app_title = detail.get("title") or "小程序"
+
+        lines = [f"[小程序分享 - {app_title}]", f"标题: {title}"]
+        if desc:
+            lines.append(f"简介: {desc}")
+        if url:
+            lines.append(f"跳转链接: {url}")
+        if preview:
+            lines.append(f"封面图: {preview}")
+        return "\n".join(lines)
+
+    # 1) 通用图文/小程序卡片（如小红书、微信图文）
+    if app == "com.tencent.tuwen.lua":
+        news = data.get("meta", {}).get("news", {}) or {}
+        title = news.get("title") or "无标题"
+        desc = news.get("desc") or ""
+        url = news.get("jumpUrl") or ""
+        preview = news.get("preview") or ""
+        tag = news.get("tag") or "图文消息"
+        lines = [f"[图文/小程序分享 - {tag}]", f"标题: {title}"]
+        if desc:
+            lines.append(f"简介: {desc}")
+        if url:
+            lines.append(f"跳转链接: {url}")
+        if preview:
+            lines.append(f"封面图: {preview}")
+        return "\n".join(lines)
+
+    # 兜底：未知 JSON 类型，使用 prompt/desc 作为简要说明
+    prompt = data.get("prompt") or data.get("desc") or ""
+    return str(prompt) if prompt else ""
+
+
 def try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str], bool]:
     """尽量从 Reply 组件中得到被引用消息的文本与图片。
 
@@ -134,6 +221,28 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
                         url = d.get("url") or d.get("file")
                         if isinstance(url, str) and url:
                             images.append(url)
+                    elif t == "json":
+                        # Napcat JSON 消息：核心数据在 data.data 中，需要再次解析
+                        raw = d.get("data")
+                        if isinstance(raw, str) and raw.strip():
+                            try:
+                                inner = json.loads(raw)
+                                summary = _format_json_share(inner)
+                                if summary:
+                                    texts.append(summary)
+                            except Exception as e:
+                                logger.warning(f"zssm_explain: parse json segment failed: {e}")
+                    elif t == "file":
+                        # Napcat 文件消息：data.file 为标识，data.name/summary 为展示信息
+                        name = d.get("name") or d.get("file") or "未命名文件"
+                        summary = d.get("summary") or ""
+                        file_id = d.get("file") or ""
+                        parts = [f"[群文件] {name}"]
+                        if summary:
+                            parts.append(f"说明: {summary}")
+                        if file_id:
+                            parts.append(f"文件标识: {file_id}")
+                        texts.append("\n".join(parts))
                     # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                 except Exception as e:
                     logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
@@ -149,6 +258,102 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
     return ("", images)
 
 
+def _extract_forward_nodes_recursively(
+    message_nodes: List[Any],
+    texts: List[str],
+    images: List[str],
+    depth: int = 0,
+) -> None:
+    """递归解析 Napcat/OneBot get_forward_msg 返回的 messages 列表，支持嵌套合并转发。
+
+    设计目标：
+    - 复用 forward_reader 插件中的核心递归思路，但以纯函数方式实现，便于在工具函数中复用；
+    - 只负责结构展开与文本/图片提取，不做任何网络调用。
+    """
+    if not isinstance(message_nodes, list):
+        return
+
+    indent = "  " * depth
+
+    for message_node in message_nodes:
+        try:
+            if not isinstance(message_node, dict):
+                continue
+
+            sender = message_node.get("sender") or {}
+            sender_name = (
+                sender.get("nickname")
+                or sender.get("card")
+                or sender.get("user_id")
+                or "未知用户"
+            )
+
+            raw_content = message_node.get("message") or message_node.get("content", [])
+
+            content_chain: List[Any] = []
+            if isinstance(raw_content, str):
+                try:
+                    parsed_content = json.loads(raw_content)
+                    if isinstance(parsed_content, list):
+                        content_chain = parsed_content
+                except (json.JSONDecodeError, TypeError):
+                    # 无法解析为 JSON 的字符串，当作纯文本处理
+                    content_chain = [
+                        {
+                            "type": "text",
+                            "data": {"text": raw_content},
+                        }
+                    ]
+            elif isinstance(raw_content, list):
+                content_chain = raw_content
+
+            node_text_parts: List[str] = []
+            has_only_forward = False
+
+            if isinstance(content_chain, list):
+                first_seg = (
+                    content_chain[0]
+                    if len(content_chain) == 1 and isinstance(content_chain[0], dict)
+                    else None
+                )
+                if first_seg and first_seg.get("type") == "forward":
+                    has_only_forward = True
+
+                for seg in content_chain:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_type = seg.get("type")
+                    seg_data = (
+                        seg.get("data", {})
+                        if isinstance(seg.get("data"), dict)
+                        else {}
+                    )
+
+                    if seg_type in ("text", "plain"):
+                        text = seg_data.get("text", "")
+                        if isinstance(text, str) and text:
+                            node_text_parts.append(text)
+                    elif seg_type == "image":
+                        url = seg_data.get("url") or seg_data.get("file")
+                        if isinstance(url, str) and url:
+                            images.append(url)
+                            node_text_parts.append("[图片]")
+                    elif seg_type == "forward":
+                        nested_content = seg_data.get("content")
+                        if isinstance(nested_content, list):
+                            _extract_forward_nodes_recursively(
+                                nested_content, texts, images, depth + 1
+                            )
+                        else:
+                            node_text_parts.append("[转发消息内容缺失或格式错误]")
+
+            full_node_text = "".join(node_text_parts).strip()
+            if full_node_text and not has_only_forward:
+                texts.append(f"{indent}{sender_name}: {full_node_text}")
+        except Exception as e:
+            logger.warning(f"zssm_explain: parse forward node failed: {e}")
+
+
 def extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
     """解析 OneBot get_forward_msg 返回的 messages/nodes 列表，汇总文本与图片。"""
     texts: List[str] = []
@@ -162,18 +367,10 @@ def extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
             or data.get("nodeList")
         )
         if isinstance(msgs, list):
-            for node in msgs:
-                try:
-                    content = None
-                    if isinstance(node, dict):
-                        content = node.get("content") or node.get("message")
-                    if isinstance(content, list):
-                        t, i = extract_from_onebot_message_payload({"message": content})
-                        if t:
-                            texts.append(t)
-                        images.extend(i)
-                except Exception:
-                    continue
+            try:
+                _extract_forward_nodes_recursively(msgs, texts, images, depth=0)
+            except Exception as e:
+                logger.warning(f"zssm_explain: parse forward payload failed: {e}")
     return ("\n".join([x for x in texts if x]).strip(), images)
 
 
@@ -228,7 +425,8 @@ async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str]
                     for seg in msg_list:
                         if not isinstance(seg, dict):
                             continue
-                        if seg.get("type") in ("forward", "forward_msg", "nodes"):
+                        seg_type = seg.get("type")
+                        if seg_type in ("forward", "forward_msg", "nodes"):
                             from_forward_ob = True
                             d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
                             fid = d.get("id")
@@ -242,6 +440,38 @@ async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str]
                                         agg_imgs.extend(fi)
                                 except Exception as fe:
                                     logger.warning(f"zssm_explain: get_forward_msg failed: {fe}")
+                        elif seg_type == "json":
+                            try:
+                                d = (
+                                    seg.get("data", {})
+                                    if isinstance(seg.get("data"), dict)
+                                    else {}
+                                )
+                                inner_data_str = d.get("data")
+                                if isinstance(inner_data_str, str) and inner_data_str.strip():
+                                    inner_data_str = inner_data_str.replace("&#44;", ",")
+                                    inner_json = json.loads(inner_data_str)
+                                    if inner_json.get("app") == "com.tencent.multimsg" and inner_json.get(
+                                        "config", {}
+                                    ).get("forward") == 1:
+                                        detail = inner_json.get("meta", {}).get("detail", {}) or {}
+                                        news_items = detail.get("news", []) or []
+                                        for item in news_items:
+                                            if not isinstance(item, dict):
+                                                continue
+                                            text_content = item.get("text")
+                                            if isinstance(text_content, str):
+                                                clean_text = (
+                                                    text_content.strip().replace("[图片]", "").strip()
+                                                )
+                                                if clean_text:
+                                                    agg_texts.append(clean_text)
+                                        if news_items:
+                                            from_forward_ob = True
+                            except (json.JSONDecodeError, TypeError, KeyError) as je:
+                                logger.debug(
+                                    f"zssm_explain: parse multimsg json in get_msg failed: {je}"
+                                )
             except Exception:
                 pass
             if agg_texts or agg_imgs:
